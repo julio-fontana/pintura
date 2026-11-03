@@ -132,6 +132,9 @@
     <label class="btn azul" style="text-align:center">📷 SACAR FOTO
       <input id="inFoto" type="file" accept="image/*" capture="environment" style="display:none" onchange="fotoElegida(this)">
     </label>
+    <label class="btn blanco" style="text-align:center">🖼️ Si no abre la cámara: elegir foto
+      <input type="file" accept="image/*" style="display:none" onchange="fotoElegida(this)">
+    </label>
     <button class="btn blanco" onclick="volverMenu()">Cancelar esta vaca</button>
     <div id="msgVaca" class="msg"></div>
   </div>
@@ -183,7 +186,7 @@
 /* ===================== CONFIGURACION ===================== */
 // URL de la app de Servicios (la misma /exec que usan los inseminadores)
 var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz_gPN5fw8x-tn76TIoNFGR1KQK12u8VOcJ-qqVB71GnDvt8bI92bSVGplEJuPjsiQMzA/exec';
-var VERSION = 'pintura v2.1 02/11/2026 (alta EID + instalable)';
+var VERSION = 'pintura v2.2 03/11/2026 (boton alternativo de foto)';
 var SPP = '00001101-0000-1000-8000-00805f9b34fb';   // perfil serie Bluetooth del baston
 var DOBLE_LECTURA_MS = 10000;                         // misma caravana dentro de 10 s = 1 lectura
 
