@@ -145,7 +145,7 @@
     <canvas id="lienzo"></canvas>
     <div id="msgFoto" class="msg"></div>
     <div class="fila2">
-      <button class="btn blanco" onclick="deshacerToque()">Deshacer toque</button>
+      <button id="btnDeshacer" class="btn blanco" onclick="deshacerToque()">Deshacer toque</button>
       <label class="btn blanco" style="text-align:center">Otra foto
         <input type="file" accept="image/*" capture="environment" style="display:none" onchange="fotoElegida(this)">
       </label>
@@ -186,7 +186,7 @@
 /* ===================== CONFIGURACION ===================== */
 // URL de la app de Servicios (la misma /exec que usan los inseminadores)
 var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz_gPN5fw8x-tn76TIoNFGR1KQK12u8VOcJ-qqVB71GnDvt8bI92bSVGplEJuPjsiQMzA/exec';
-var VERSION = 'pintura v2.4 03/11/2026 (varios colores)';
+var VERSION = 'pintura v2.6 12/11/2026 (color definido por la foto de pintado)';
 var SPP = '00001101-0000-1000-8000-00805f9b34fb';   // perfil serie Bluetooth del baston
 var DOBLE_LECTURA_MS = 10000;                         // misma caravana dentro de 10 s = 1 lectura
 
@@ -467,6 +467,7 @@ function fotoElegida(input) {
     FOTO.placa = pl; FOTO.ppc = pl ? pl.ppc : null;
     irA('pFoto');
     if (!pl) msg($('msgFoto'), 'NO SE VE LA PLAQUITA FUCSIA. Sacá otra foto con la plaquita apoyada en la cadera derecha, entera y sin sombra.', 'err');
+    else if (!autoBanda(FOTO)) msg($('msgFoto'), 'No encontré la franja pintada. Si está despintada del todo o la foto no la muestra bien, marcá las 2 puntas a mano.', 'err');
     else limpiar($('msgFoto'));
     dibujar();
   };
@@ -487,11 +488,21 @@ function esColor(data, i, c) {
   return enH && p[1] >= c.sMin && p[2] >= c.vMin;
 }
 function listaPinturas() { return CFG.pinturas || (CFG.pintura ? [Object.assign({ nombre: 'pintura' }, CFG.pintura)] : []); }
-function colorPorNombre(n) { var l = listaPinturas(); for (var i = 0; i < l.length; i++) if (l[i].nombre === n) return l[i]; return null; }
+function colorPorNombre(n) {
+  if (typeof FOTO !== 'undefined' && FOTO && FOTO.perfil && FOTO.perfil.nombre === n) return FOTO.perfil;
+  if (typeof VACA !== 'undefined' && VACA && VACA.t0 && VACA.t0.perfil && VACA.t0.perfil.nombre === n) return VACA.t0.perfil;
+  var l = listaPinturas(); for (var i = 0; i < l.length; i++) if (l[i].nombre === n) return l[i]; return null;
+}
+/** perfil de color guardado en el T0 (definicion de la pintura usada en esa vaca) */
+function perfilT0() { return (MODO === 'T1' && VACA.t0 && VACA.t0.perfil && VACA.t0.perfil.hMin !== undefined) ? VACA.t0.perfil : null; }
 /** Color de la franja: en T1 el mismo del T0; si no, el que mas pixeles tiene dentro de la banda. */
 function elegirColor(F, largoCm) {
   if (F.colorManual) return colorPorNombre(F.colorManual);
+  if (F.perfilT1) return F.perfilT1;
+  if (perfilT0()) return perfilT0();
+  if (F.perfil) return F.perfil;
   if (MODO === 'T1' && VACA.t0 && VACA.t0.color && colorPorNombre(VACA.t0.color)) return colorPorNombre(VACA.t0.color);
+  if (F.colorAuto && colorPorNombre(F.colorAuto)) return colorPorNombre(F.colorAuto);
   var mejor = null, max = -1;
   listaPinturas().forEach(function (c) { var n = analizar(F, largoCm, c).areaCm2; if (n > max) { max = n; mejor = c; } });
   return mejor;
@@ -515,6 +526,176 @@ function componentes(mask, w, h) {
   }
   return comps;
 }
+/** Etiqueta componentes conexas y acumula centroide: {lab, comps:[{id,n,sx,sy}]} */
+function etiquetar(mask, w, h) {
+  var lab = new Int32Array(w * h), comps = [], pila = new Int32Array(w * h);
+  for (var s = 0; s < w * h; s++) {
+    if (!mask[s] || lab[s]) continue;
+    var id = comps.length + 1, top = 0, c = { id: id, n: 0, sx: 0, sy: 0 };
+    pila[top++] = s; lab[s] = id;
+    while (top) {
+      var q = pila[--top], x = q % w, y = (q - x) / w;
+      c.n++; c.sx += x; c.sy += y;
+      if (x > 0 && mask[q - 1] && !lab[q - 1]) { lab[q - 1] = id; pila[top++] = q - 1; }
+      if (x < w - 1 && mask[q + 1] && !lab[q + 1]) { lab[q + 1] = id; pila[top++] = q + 1; }
+      if (y > 0 && mask[q - w] && !lab[q - w]) { lab[q - w] = id; pila[top++] = q - w; }
+      if (y < h - 1 && mask[q + w] && !lab[q + w]) { lab[q + w] = id; pila[top++] = q + w; }
+    }
+    c.cx = c.sx / c.n; c.cy = c.sy / c.n; comps.push(c);
+  }
+  return { lab: lab, comps: comps };
+}
+/** Eje principal (PCA) de los pixeles de los componentes elegidos */
+function ejeDe(lab, w, h, ids) {
+  var n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+  for (var k = 0; k < w * h; k++) {
+    if (!lab[k] || !ids[lab[k]]) continue;
+    var x = k % w, y = (k - x) / w; n++; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+  }
+  var cx = sx / n, cy = sy / n, vxx = sxx / n - cx * cx, vyy = syy / n - cy * cy, vxy = sxy / n - cx * cy;
+  var th = 0.5 * Math.atan2(2 * vxy, vxx - vyy);
+  return { n: n, c: [cx, cy], u: [Math.cos(th), Math.sin(th)] };
+}
+/**
+ * Busca la franja de un color cerca de la plaquita (sin toques).
+ * 1) manchon mas grande del color a menos de radioBusquedaCm de la plaquita
+ * 2) suma los pedazos a menos de 20 cm de ese manchon (franja cortada) y saca el eje
+ * 3) se queda con los pedazos a +-5 cm de ese eje -> eje final y puntas
+ */
+function buscarFranja(F, color) {
+  var w = F.ana.w, h = F.ana.h, d = F.ana.data, ppc = F.ppc, pl = F.placa;
+  var pcx = (pl.x0 + pl.x1) / 2 * w, pcy = (pl.y0 + pl.y1) / 2 * h, R = (CFG.radioBusquedaCm || 45) * ppc, mg = ppc;
+  var bx0 = pl.x0 * w - mg, bx1 = pl.x1 * w + mg, by0 = pl.y0 * h - mg, by1 = pl.y1 * h + mg;
+  var m = new Uint8Array(w * h);
+  for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) {
+    if ((x - pcx) * (x - pcx) + (y - pcy) * (y - pcy) > R * R) continue;
+    if (x >= bx0 && x <= bx1 && y >= by0 && y <= by1) continue;
+    var k = y * w + x; if (esColor(d, k * 4, color)) m[k] = 1;
+  }
+  var et = etiquetar(m, w, h), min = 0.5 * ppc * ppc;
+  var cs = et.comps.filter(function (c) { return c.n >= min; }).sort(function (a, b) { return b.n - a.n; });
+  if (!cs.length) return null;
+  var big = cs[0], cerca = {}, r2 = 20 * ppc;
+  cs.forEach(function (c) { if (Math.hypot(c.cx - big.cx, c.cy - big.cy) <= r2) cerca[c.id] = 1; });
+  var e = ejeDe(et.lab, w, h, cerca), hw = CFG.bandaMedioAnchoCm * ppc, ok = {};
+  cs.forEach(function (c) {
+    var rx = c.cx - e.c[0], ry = c.cy - e.c[1];
+    if (Math.abs(-rx * e.u[1] + ry * e.u[0]) <= hw && Math.abs(rx * e.u[0] + ry * e.u[1]) <= 25 * ppc) ok[c.id] = 1;
+  });
+  ok[big.id] = 1;
+  e = ejeDe(et.lab, w, h, ok);
+  var sMin = Infinity, sMax = -Infinity, hues = [], sats = [];
+  for (var q = 0; q < w * h; q++) {
+    if (!et.lab[q] || !ok[et.lab[q]]) continue;
+    if ((q & 3) === 0) { var pp = hsv(d[q * 4], d[q * 4 + 1], d[q * 4 + 2]); hues.push(pp[0]); sats.push(pp[1]); }
+    var px = q % w, py = (q - px) / w, sp = (px - e.c[0]) * e.u[0] + (py - e.c[1]) * e.u[1];
+    if (sp < sMin) sMin = sp; if (sp > sMax) sMax = sp;
+  }
+  e.sMin = sMin; e.sMax = sMax; e.hues = hues; e.sats = sats; return e;
+}
+/** Tono dominante de lo saturado cerca de la plaquita (sin la plaquita): la pintura */
+function picoColor(F) {
+  var w = F.ana.w, h = F.ana.h, d = F.ana.data, ppc = F.ppc, pl = F.placa;
+  var pcx = (pl.x0 + pl.x1) / 2 * w, pcy = (pl.y0 + pl.y1) / 2 * h, R = (CFG.radioBusquedaCm || 45) * ppc, mg = ppc;
+  var bx0 = pl.x0 * w - mg, bx1 = pl.x1 * w + mg, by0 = pl.y0 * h - mg, by1 = pl.y1 * h + mg;
+  var hist = new Float64Array(72), pc = CFG.placa;
+  for (var y = 0; y < h; y += 2) for (var x = 0; x < w; x += 2) {
+    if ((x - pcx) * (x - pcx) + (y - pcy) * (y - pcy) > R * R) continue;
+    if (x >= bx0 && x <= bx1 && y >= by0 && y <= by1) continue;
+    var k = (y * w + x) * 4, p = hsv(d[k], d[k + 1], d[k + 2]);
+    if (p[1] < 0.25 || p[2] < 0.2) continue;
+    if (p[0] >= pc.hMin && p[0] <= pc.hMax) continue;           // tono de la plaquita
+    hist[Math.floor(p[0] / 5) % 72] += p[1] * p[1];             // pesa lo bien saturado (pintura, no barro ni piel)
+  }
+  // hasta 3 picos separados al menos 30 grados (la pintura, la manga del operario, la piel, el barro...)
+  var sm = [], picos = [];
+  for (var i = 0; i < 72; i++) sm.push(hist[(i + 71) % 72] + 2 * hist[i] + hist[(i + 1) % 72]);
+  for (var n = 0; n < 6; n++) {
+    var best = 0, bi = -1;
+    for (var j = 0; j < 72; j++) {
+      if (sm[j] <= best) continue;
+      if (picos.some(function (pk) { return Math.abs(((j * 5 + 2.5 - pk + 540) % 360) - 180) < 15; })) continue;
+      best = sm[j]; bi = j;
+    }
+    if (bi < 0) break;
+    picos.push(bi * 5 + 2.5);
+  }
+  return picos;
+}
+function nombreCercano(hue) {
+  var l = listaPinturas(), mejor = 'auto', dmin = 1e9;
+  l.forEach(function (c) {
+    var cen = c.hMin <= c.hMax ? (c.hMin + c.hMax) / 2 : ((c.hMin + c.hMax + 360) / 2) % 360;
+    var dd = Math.abs(((hue - cen + 540) % 360) - 180); if (dd < dmin) { dmin = dd; mejor = c.nombre; }
+  });
+  return mejor;
+}
+function pctl(a, p) { var b = a.slice().sort(function (x, y) { return x - y; }); return b.length ? b[Math.min(b.length - 1, Math.floor(p * b.length))] : 0; }
+/**
+ * Perfil automatico (T0): define el color con la pintura de ESTA foto.
+ * pico de tono -> franja con +-20 grados -> tono p3..p97 (+-6) y saturacion minima = mitad de la mediana.
+ */
+function perfilAuto(F) {
+  var picos = picoColor(F); if (!picos.length) return null;
+  // de cada pico, la mancha que se parece a una franja: 10-40 cm de largo y alargada (no la manga ni la mano)
+  var mejor = null;
+  picos.forEach(function (pk) {
+    var c0 = { nombre: 'busqueda', hMin: (pk - 12 + 360) % 360, hMax: (pk + 12) % 360, sMin: 0.25, vMin: 0.2 };
+    var r = buscarFranja(F, c0); if (!r || r.hues.length < 50) return;
+    var L = (r.sMax - r.sMin) / F.ppc, area = r.n / (F.ppc * F.ppc), ancho = area / Math.max(L, 1);
+    var franja = L >= 10 && L <= 40 && L / ancho >= 2.5;
+    var sMed = pctl(r.sats, 0.5);
+    var puntos = area * sMed * sMed * sMed * (franja ? 10 : 1);   // la pintura es mas viva que el barro, la piel o la ropa
+    if (!mejor || puntos > mejor.puntos) mejor = { r: r, pico: pk, puntos: puntos };
+  });
+  if (!mejor) return null;
+  var r = mejor.r, pico = mejor.pico;
+  var dh = r.hues.map(function (x) { return ((x - pico + 540) % 360) - 180; });
+  var lo = Math.min(pctl(dh, 0.03) - 4, -8), hi = Math.max(pctl(dh, 0.97) + 4, 8);
+  var sMin = Math.max(0.18, Math.min(0.45, 0.5 * pctl(r.sats, 0.5)));
+  return { nombre: 'auto-' + nombreCercano(pico), hMin: Math.round((pico + lo + 360) % 360), hMax: Math.round((pico + hi + 360) % 360),
+           sMin: Math.round(sMin * 100) / 100, vMin: 0.2, pico: pico };
+}
+
+/**
+ * T1: la misma pintura con otra luz cambia unos grados de tono. Se busca el pico de esta foto mas cercano al del
+ * pintado (hasta 10 grados) y se corre el rango del T0 esa diferencia. Mas de 10 grados no: seria barro o piel.
+ */
+function ajustarLuz(F, p0) {
+  if (p0.pico === undefined) return p0;
+  var picos = picoColor(F), mejor = null;
+  picos.forEach(function (pk) { var dd = ((pk - p0.pico + 540) % 360) - 180; if (Math.abs(dd) <= 10 && (mejor === null || Math.abs(dd) < Math.abs(mejor))) mejor = dd; });
+  if (!mejor) return p0;
+  return Object.assign({}, p0, { hMin: Math.round((p0.hMin + mejor + 360) % 360), hMax: Math.round((p0.hMax + mejor + 360) % 360), corrimiento: mejor });
+}
+
+/** Pone los 2 toques solo. T0: puntas de la franja. T1: largo del T0, centrado en la pintura que queda. */
+function autoBanda(F) {
+  if (!F.placa) return false;
+  var cols;
+  if (F.colorManual) cols = [colorPorNombre(F.colorManual)];
+  else if (perfilT0()) { F.perfilT1 = ajustarLuz(F, perfilT0()); cols = [F.perfilT1]; }   // T1: la pintura definida en el pintado
+  else if (MODO === 'T1' && VACA.t0 && VACA.t0.color && colorPorNombre(VACA.t0.color)) cols = [colorPorNombre(VACA.t0.color)];
+  else {                                                                       // T0: definir la pintura con esta foto
+    F.perfil = perfilAuto(F);
+    cols = F.perfil ? [F.perfil] : listaPinturas();
+  }
+  var best = null, bc = null;
+  cols.forEach(function (c) { if (!c) return; var r = buscarFranja(F, c); if (r && (!best || r.n > best.n)) { best = r; bc = c; } });
+  if (!best && MODO === 'T1' && cols.length === 1 && cols[0]) {
+    // T1 muy despintada: ubicar la franja con el residuo palido del mismo tono (solo para el recuadro; se mide con el color del T0)
+    best = buscarFranja(F, Object.assign({}, cols[0], { sMin: 0.1 })); bc = cols[0];
+  }
+  if (!best) { F.auto = false; return false; }
+  var w = F.ana.w, h = F.ana.h, mid = (best.sMin + best.sMax) / 2, L = best.sMax - best.sMin;
+  if (MODO === 'T1' && VACA.t0 && VACA.t0.largo > 0) L = VACA.t0.largo * F.ppc;
+  F.colorAuto = bc.nombre; F.auto = true; F.prev = null;
+  F.toques = [-1, 1].map(function (sg) {
+    return { x: (best.c[0] + best.u[0] * (mid + sg * L / 2)) / w, y: (best.c[1] + best.u[1] * (mid + sg * L / 2)) / h };
+  });
+  return true;
+}
+
 /** Plaquita: el manchon fucsia mas grande, mas o menos cuadrado y lleno */
 function detectarPlaca(ana, cfg) {
   var w = ana.w, h = ana.h, m = new Uint8Array(w * h);
@@ -532,6 +713,7 @@ function detectarPlaca(ana, cfg) {
 function textoToque() {
   var n = FOTO.toques.length;
   if (!FOTO.placa) return 'Falta la plaquita';
+  if (FOTO.auto) return 'Recuadro AUTOMÁTICO: si cubre la franja pintada tocá LISTO. Si no, tocá "Marcar a mano".';
   if (n === 0) return 'Tocá la punta de la franja del lado de la COLA';
   if (n === 1) return 'Tocá la otra punta (lado de la CABEZA)';
   return 'Revisá el recuadro amarillo y tocá LISTO';
@@ -542,7 +724,12 @@ $('lienzo').addEventListener('click', function (ev) {
   FOTO.toques.push({ x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height });
   dibujar();
 });
-function deshacerToque() { if (FOTO && FOTO.toques.length) { FOTO.toques.pop(); dibujar(); } }
+function deshacerToque() {
+  if (!FOTO) return;
+  if (FOTO.auto) { FOTO.auto = false; FOTO.toques = []; FOTO.prev = null; limpiar($('msgFoto')); }
+  else if (FOTO.toques.length) FOTO.toques.pop();
+  dibujar();
+}
 
 function dibujar() {
   var cv = $('lienzo'), v = FOTO.vista;
@@ -565,18 +752,19 @@ function dibujar() {
     x.beginPath(); a.poligono.forEach(function (p, i) { var px = p[0] / FOTO.ana.w * W, py = p[1] / FOTO.ana.h * H; if (i) x.lineTo(px, py); else x.moveTo(px, py); });
     x.closePath(); x.stroke(); x.setLineDash([]);
   }
-  FOTO.toques.forEach(function (p, i) {
+  if (!FOTO.auto) FOTO.toques.forEach(function (p, i) {
     x.beginPath(); x.arc(p.x * W, p.y * H, Math.max(14, W / 60), 0, 7);
     x.fillStyle = 'rgba(255,0,204,.85)'; x.fill();
     x.fillStyle = '#fff'; x.font = 'bold ' + Math.max(18, W / 40) + 'px Arial'; x.textAlign = 'center'; x.textBaseline = 'middle';
     x.fillText(String(i + 1), p.x * W, p.y * H);
   });
   $('instrFoto').textContent = textoToque();
+  $('btnDeshacer').textContent = FOTO.auto ? 'Marcar a mano' : 'Deshacer toque';
   $('btnAnalizar').disabled = !(FOTO.placa && FOTO.toques.length === 2);
 }
 
 /** T0: largo = distancia entre toques. T1: largo = el medido en T0 (los toques solo dan la direccion). */
-function largoBanda() { return (MODO === 'T1' && VACA.t0 && VACA.t0.largo > 0) ? VACA.t0.largo : null; }
+function largoBanda() { if (FOTO && FOTO.auto) return null; return (MODO === 'T1' && VACA.t0 && VACA.t0.largo > 0) ? VACA.t0.largo : null; }
 
 /* ---------- analisis ---------- */
 function analizar(F, largoCm, color) {
@@ -639,7 +827,7 @@ function mostrarResultado() {
     if (a.anchoCm < 3) { linea('Poca pintura en la franja: repasala y sacá otra foto.', 'alerta'); malo = true; }
     if (!malo) linea('Pintado correcto', 'ok');
     boton('GUARDAR FOTO DE PINTADO', '', function () { guardarFoto(null); });
-    boton('Rehacer toques', 'blanco', function () { FOTO.toques = []; irA('pFoto'); dibujar(); });
+    boton('Corregir recuadro', 'blanco', function () { irA('pFoto'); dibujar(); });
     return;
   }
   // T1
@@ -662,14 +850,16 @@ function mostrarResultado() {
   boton('INSEMINAR → cargar servicio', '', function () { $('sCaravana').textContent = VACA.id; limpiar($('msgServ')); irA('pServicio'); });
   boton('ESPERAR (otra foto en la próxima ronda)', 'ambar', function () { guardarFoto('ESPERAR'); });
   boton('NO INSEMINAR', 'rojo', function () { guardarFoto('NO_INSEMINAR'); });
-  boton('Rehacer toques', 'blanco', function () { FOTO.toques = []; irA('pFoto'); dibujar(); });
+  boton('Corregir recuadro', 'blanco', function () { irA('pFoto'); dibujar(); });
 }
 
 /** Color de pintura medido + botones para cambiarlo si la app se equivoco */
 function selectorColor(C, a) {
-  var cols = listaPinturas(); if (cols.length < 2) return;
+  var cols = listaPinturas().slice();
+  var pa = FOTO.perfilT1 || perfilT0() || FOTO.perfil; if (pa) cols.unshift(pa);
+  if (cols.length < 2) return;
   var d = document.createElement('div'); d.className = 'linea neutro';
-  var t0 = (MODO === 'T1' && VACA.t0 && VACA.t0.color) ? VACA.t0.color : '';
+  var t0 = (MODO === 'T1' && VACA.t0 && VACA.t0.color && !perfilT0()) ? VACA.t0.color : '';
   d.innerHTML = 'Color medido: <b>' + String(a.color).toUpperCase() + '</b>' +
     (t0 && t0 !== a.color ? ' <span style="color:#c00">(en el pintado fue ' + t0.toUpperCase() + ')</span>' : '') +
     '<br><small>Si no es el color de la pintura, tocá el correcto:</small><br>';
@@ -677,7 +867,7 @@ function selectorColor(C, a) {
     var b = document.createElement('button'); b.textContent = c.nombre; b.type = 'button';
     b.style.cssText = 'margin:4px 4px 0 0;padding:8px 12px;font-size:15px;border-radius:8px;border:2px solid ' +
       (c.nombre === a.color ? '#000;font-weight:bold' : '#bbb');
-    b.onclick = function () { FOTO.colorManual = c.nombre; FOTO.prev = null; mostrarResultado(); };
+    b.onclick = function () { FOTO.colorManual = c.nombre; FOTO.prev = null; if (FOTO.auto) autoBanda(FOTO); mostrarResultado(); };
     d.appendChild(b);
   });
   C.appendChild(d);
@@ -688,7 +878,7 @@ async function guardarFoto(decision, idServicio) {
   msg(el, 'Guardando la foto... (no cierres la app)', 'info');
   document.querySelectorAll('#rBotones button, #btnServ').forEach(function (b) { b.disabled = true; });
   var datos = { id: VACA.id, eid: VACA.eid, lectura: VACA.lectura, foto: FOTO.jpg, version: VERSION,
-    a: { color: a.color, ppc: a.ppc, largoCm: a.largoCm, anchoCm: a.anchoCm, areaCm2: a.areaCm2, dispersionCm2: a.dispersionCm2,
+    a: { color: a.color, perfil: (FOTO.perfil && a.color === FOTO.perfil.nombre) ? JSON.stringify(FOTO.perfil) : '', marcado: FOTO.auto ? 'auto' : 'manual', ppc: a.ppc, largoCm: a.largoCm, anchoCm: a.anchoCm, areaCm2: a.areaCm2, dispersionCm2: a.dispersionCm2,
          fragmentos: a.fragmentos, toques: a.toques, pct: a.pct, score: a.score, recomendacion: a.recomendacion } };
   if (MODO === 'T1') {
     datos.decision = decision; datos.idServicio = idServicio || '';
